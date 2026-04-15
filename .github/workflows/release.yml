@@ -1,48 +1,84 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            bin: un-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            bin: un-linux-aarch64
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            asset_name: un-linux-x86_64
+            linker: ""
+          - name: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            asset_name: un-linux-aarch64
+            linker: aarch64-linux-gnu-gcc
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install aarch64 linker
+        if: matrix.linker != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build
+      - name: Build release binary
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --target "${{ matrix.target }}"
 
-      - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/un ${{ matrix.bin }}
+      - name: Prepare asset
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/un" "dist/${{ matrix.asset_name }}"
+          chmod +x "dist/${{ matrix.asset_name }}"
 
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
 
-      - name: Upload to release
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifact directories
+        run: |
+          mkdir -p release-assets
+          find dist -type f -exec cp {} release-assets/ \;
+
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.bin }}
+          files: release-assets/*

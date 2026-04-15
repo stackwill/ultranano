@@ -87,7 +87,7 @@ fn run_event_loop(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>>
 
         // Render editor
         let visible_rows = rows.saturating_sub(1) as usize;
-        let state = editor.render_state(visible_rows);
+        let state = editor.render_state(visible_rows, cols);
         render::render_frame(&state, &mut stdout, cols, rows)?;
 
         // Read key event (blocking)

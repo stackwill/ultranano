@@ -5,7 +5,7 @@
 
 ![Made with VHS](https://vhs.charm.sh/vhs-4GvO2F0mv1ifSWrBoOidRz.gif)
 
-An incredibly minimal terminal text editor with syntax highlighting, inspired by nano.
+An incredibly minimal terminal text editor inspired by nano.
 
 ## Install
 
@@ -24,6 +24,7 @@ un <filename>
 ## Features
 
 - Unicode-aware cursor movement and editing
+- Horizontal scrolling with visible truncation markers
 - Cut/paste line operations
 - Search with wrap-around
 - Nano-style keybindings
