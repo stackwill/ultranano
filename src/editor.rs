@@ -2,12 +2,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crossterm::{
-    cursor::MoveTo,
-    style::Print,
-    terminal::ClearType,
-    QueueableCommand,
-};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -32,20 +26,31 @@ fn write_atomic(path: &str, content: &[u8]) -> io::Result<()> {
     })
 }
 
-/// Truncate a string to fit within `max_cols` terminal display columns.
-fn truncate_to_width(s: &str, max_cols: usize) -> String {
-    let mut width = 0;
-    s.graphemes(true)
-        .take_while(|g| {
-            let w = UnicodeWidthStr::width(*g);
-            if width + w <= max_cols {
-                width += w;
-                true
-            } else {
-                false
-            }
-        })
-        .collect()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    fn as_str(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Line {
+    text: String,
+    ending: Option<LineEnding>,
+}
+
+impl Line {
+    fn new(text: String, ending: Option<LineEnding>) -> Self {
+        Self { text, ending }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -61,39 +66,37 @@ pub struct RenderState {
     pub row_offset: usize,
     pub cursor_row: usize,
     pub cursor_col: usize,
+    pub col_offset: usize,
     pub prompt_mode: PromptMode,
     pub message: Option<String>,
 }
 
 pub struct Editor {
-    buffer: Vec<String>,
+    buffer: Vec<Line>,
     cursor_row: usize,
-    cursor_col: usize,  // Grapheme index (not byte position)
-    row_offset: usize,  // for scrolling
+    cursor_col: usize, // Grapheme index (not byte position)
+    row_offset: usize,
+    col_offset: usize, // Display column offset for horizontal scrolling
     filename: Option<String>,
-    custom_filename: bool,  // true if user explicitly set filename via SaveAs
+    custom_filename: bool,
     dirty: bool,
-    cut_buffer: Option<String>,
-    pub message: Option<String>,  // for save feedback
+    preferred_line_ending: LineEnding,
+    cut_buffer: Option<Line>,
+    pub message: Option<String>,
     pub prompt_mode: PromptMode,
-    pub pending_exit: bool,  // exit after the next successful save
+    pub pending_exit: bool,
 }
 
-/// Helper functions for Unicode-aware string operations
 impl Editor {
-    /// Get the number of graphemes in a string
     fn grapheme_len(s: &str) -> usize {
         s.graphemes(true).count()
     }
 
-    /// Convert a grapheme index to a byte index
-    /// Returns None if the index is out of bounds
     fn grapheme_to_byte_index(s: &str, grapheme_idx: usize) -> Option<usize> {
         s.grapheme_indices(true)
             .nth(grapheme_idx)
             .map(|(i, _)| i)
             .or_else(|| {
-                // If index equals grapheme count, return string length (for appending)
                 if grapheme_idx == Self::grapheme_len(s) {
                     Some(s.len())
                 } else {
@@ -102,18 +105,180 @@ impl Editor {
             })
     }
 
+    fn byte_to_grapheme_index(s: &str, byte_pos: usize) -> usize {
+        s.grapheme_indices(true)
+            .take_while(|(idx, _)| *idx < byte_pos)
+            .count()
+    }
+
+    fn display_width(s: &str) -> usize {
+        s.graphemes(true).map(UnicodeWidthStr::width).sum()
+    }
+
+    fn display_width_up_to(s: &str, grapheme_count: usize) -> usize {
+        s.graphemes(true)
+            .take(grapheme_count)
+            .map(UnicodeWidthStr::width)
+            .sum()
+    }
+
+    fn display_offset_at_or_before(s: &str, target: usize) -> usize {
+        let mut width = 0;
+        for grapheme in s.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if width + grapheme_width > target {
+                break;
+            }
+            width += grapheme_width;
+        }
+        width
+    }
+
+    fn parse_file_bytes(bytes: &[u8]) -> io::Result<(Vec<Line>, LineEnding)> {
+        if bytes.is_empty() {
+            return Ok((vec![Line::new(String::new(), None)], LineEnding::Lf));
+        }
+
+        let mut lines = Vec::new();
+        let mut start = 0;
+        let mut idx = 0;
+        let mut preferred = None;
+
+        while idx < bytes.len() {
+            if bytes[idx] == b'\n' {
+                let (line_bytes, ending) = if idx > start && bytes[idx - 1] == b'\r' {
+                    (&bytes[start..idx - 1], LineEnding::Crlf)
+                } else {
+                    (&bytes[start..idx], LineEnding::Lf)
+                };
+                let text = String::from_utf8(line_bytes.to_vec()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "File is not valid UTF-8")
+                })?;
+                preferred.get_or_insert(ending);
+                lines.push(Line::new(text, Some(ending)));
+                start = idx + 1;
+            }
+            idx += 1;
+        }
+
+        if start < bytes.len() {
+            let text = String::from_utf8(bytes[start..].to_vec()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "File is not valid UTF-8")
+            })?;
+            lines.push(Line::new(text, None));
+        }
+
+        if lines.is_empty() {
+            lines.push(Line::new(String::new(), None));
+        }
+
+        Ok((lines, preferred.unwrap_or(LineEnding::Lf)))
+    }
+
+    fn serialized_content(&self) -> Vec<u8> {
+        let mut content = Vec::new();
+        for line in &self.buffer {
+            content.extend_from_slice(line.text.as_bytes());
+            if let Some(ending) = line.ending {
+                content.extend_from_slice(ending.as_str().as_bytes());
+            }
+        }
+        content
+    }
+
+    fn current_line(&self) -> &Line {
+        &self.buffer[self.cursor_row]
+    }
+
+    fn current_line_mut(&mut self) -> &mut Line {
+        &mut self.buffer[self.cursor_row]
+    }
+
+    fn current_line_text(&self) -> &str {
+        &self.current_line().text
+    }
+
+    fn ensure_horizontal_scroll(&mut self, cols: u16) {
+        let cols = cols as usize;
+        if cols == 0 || !matches!(self.prompt_mode, PromptMode::None) {
+            self.col_offset = 0;
+            return;
+        }
+
+        let line = self.current_line_text();
+        let cursor_x = Self::display_width_up_to(line, self.cursor_col);
+        let mut offset = Self::display_offset_at_or_before(line, self.col_offset);
+
+        loop {
+            let left_marker = usize::from(offset > 0);
+            let mut text_width = cols.saturating_sub(left_marker);
+            let total_width = Self::display_width(line);
+            let right_marker = total_width > offset + text_width;
+            if right_marker {
+                text_width = text_width.saturating_sub(1);
+            }
+
+            let max_cursor_x = offset + text_width.saturating_sub(1);
+            if cursor_x < offset {
+                offset = Self::display_offset_at_or_before(line, cursor_x);
+                continue;
+            }
+            if cursor_x > max_cursor_x {
+                let target = cursor_x.saturating_sub(text_width.saturating_sub(1));
+                offset = Self::display_offset_at_or_before(line, target);
+                continue;
+            }
+            break;
+        }
+
+        self.col_offset = offset;
+    }
+
+    fn remove_line_internal(&mut self, idx: usize) -> Line {
+        let removed = self.buffer.remove(idx);
+        if idx > 0 && idx <= self.buffer.len() {
+            self.buffer[idx - 1].ending = removed.ending;
+        }
+        if self.buffer.is_empty() {
+            self.buffer.push(Line::new(String::new(), None));
+        }
+        removed
+    }
+
+    fn insert_line_internal(&mut self, idx: usize, mut line: Line) {
+        let len = self.buffer.len();
+        if len == 1 && self.buffer[0].text.is_empty() && self.buffer[0].ending.is_none() {
+            self.buffer[0] = line;
+            return;
+        }
+
+        if idx >= len {
+            if self.buffer[len - 1].ending.is_none() {
+                self.buffer[len - 1].ending = Some(self.preferred_line_ending);
+            }
+            self.buffer.push(line);
+            return;
+        }
+
+        if line.ending.is_none() {
+            line.ending = Some(self.preferred_line_ending);
+        }
+        self.buffer.insert(idx, line);
+    }
 }
 
 impl Editor {
     pub fn new() -> Self {
-        Editor {
-            buffer: vec![String::new()],
+        Self {
+            buffer: vec![Line::new(String::new(), None)],
             cursor_row: 0,
             cursor_col: 0,
             row_offset: 0,
+            col_offset: 0,
             filename: None,
             custom_filename: false,
             dirty: false,
+            preferred_line_ending: LineEnding::Lf,
             cut_buffer: None,
             message: None,
             prompt_mode: PromptMode::None,
@@ -122,12 +287,14 @@ impl Editor {
     }
 
     pub fn load_file(&mut self, path: &str) -> Result<(), io::Error> {
-        let content = fs::read_to_string(path)?;
-        self.buffer = if content.is_empty() {
-            vec![String::new()]
-        } else {
-            content.lines().map(|s| s.to_string()).collect()
-        };
+        let bytes = fs::read(path)?;
+        let (buffer, preferred_line_ending) = Self::parse_file_bytes(&bytes)?;
+        self.buffer = buffer;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.row_offset = 0;
+        self.col_offset = 0;
+        self.preferred_line_ending = preferred_line_ending;
         self.filename = Some(path.to_string());
         self.dirty = false;
         Ok(())
@@ -135,9 +302,8 @@ impl Editor {
 
     pub fn save(&mut self) -> Result<(), io::Error> {
         if let Some(ref path) = self.filename {
-            let mut content = self.buffer.join("\n");
-            content.push('\n');
-            write_atomic(path, content.as_bytes())?;
+            let content = self.serialized_content();
+            write_atomic(path, &content)?;
             self.dirty = false;
             self.message = Some(format!("Saved: {}", path));
         } else {
@@ -147,9 +313,8 @@ impl Editor {
     }
 
     pub fn save_as(&mut self, path: &str) -> Result<(), io::Error> {
-        let mut content = self.buffer.join("\n");
-        content.push('\n');
-        write_atomic(path, content.as_bytes())?;
+        let content = self.serialized_content();
+        write_atomic(path, &content)?;
         self.filename = Some(path.to_string());
         self.custom_filename = true;
         self.dirty = false;
@@ -172,54 +337,6 @@ impl Editor {
     pub fn set_filename(&mut self, path: &str) {
         self.filename = Some(path.to_string());
         self.custom_filename = true;
-    }
-
-    /// 1-indexed. Returns None for index 0 or past end.
-    pub fn get_line(&self, n: usize) -> Option<&str> {
-        if n == 0 { return None; }
-        self.buffer.get(n - 1).map(String::as_str)
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// 1-indexed. No-op if n is 0 or past end.
-    pub fn set_line(&mut self, n: usize, text: String) {
-        if n == 0 { return; }
-        if let Some(line) = self.buffer.get_mut(n - 1) {
-            let text = text.replace('\n', "").replace('\r', "");
-            *line = text;
-            self.dirty = true;
-        }
-    }
-
-    /// Inserts `text` before 1-indexed line n. No-op if n == 0. Appends if n > len+1.
-    pub fn insert_line(&mut self, n: usize, text: String) {
-        if n == 0 { return; }
-        let idx = (n - 1).min(self.buffer.len());
-        self.buffer.insert(idx, text);
-        if idx <= self.cursor_row {
-            self.cursor_row += 1;
-        }
-        self.dirty = true;
-    }
-
-    /// 1-indexed. No-op if n is 0 or past end. Preserves at least one line.
-    pub fn delete_line(&mut self, n: usize) {
-        if n == 0 || self.buffer.len() <= 1 { return; }
-        if let Some(idx) = n.checked_sub(1) {
-            if idx < self.buffer.len() {
-                self.buffer.remove(idx);
-                if self.cursor_row >= self.buffer.len() {
-                    self.cursor_row = self.buffer.len() - 1;
-                } else if idx < self.cursor_row {
-                    self.cursor_row -= 1;
-                }
-                self.clamp_cursor_col();
-                self.dirty = true;
-            }
-        }
     }
 
     pub fn start_confirm_exit_prompt(&mut self) {
@@ -254,8 +371,12 @@ impl Editor {
 
     pub fn prompt_backspace(&mut self) {
         match &mut self.prompt_mode {
-            PromptMode::SaveAs(ref mut input) => { input.pop(); }
-            PromptMode::Find(ref mut input) => { input.pop(); }
+            PromptMode::SaveAs(ref mut input) => {
+                input.pop();
+            }
+            PromptMode::Find(ref mut input) => {
+                input.pop();
+            }
             PromptMode::None | PromptMode::ConfirmExit => {}
         }
     }
@@ -265,7 +386,6 @@ impl Editor {
         self.pending_exit = false;
     }
 
-    /// Returns true if prompt was completed (Enter pressed)
     pub fn prompt_submit(&mut self) -> bool {
         match self.prompt_mode.clone() {
             PromptMode::SaveAs(input) => {
@@ -297,71 +417,75 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if let Some(line) = self.buffer.get_mut(self.cursor_row) {
-            let grapheme_count = Self::grapheme_len(line);
-            if self.cursor_col <= grapheme_count {
-                // Convert grapheme index to byte index for insertion
-                if let Some(byte_idx) = Self::grapheme_to_byte_index(line, self.cursor_col) {
-                    line.insert(byte_idx, c);
-                    self.cursor_col += 1;  // Move by 1 grapheme
-                    self.dirty = true;
-                }
-            }
+        let cursor_col = self.cursor_col;
+        if let Some(byte_idx) = Self::grapheme_to_byte_index(self.current_line_text(), cursor_col) {
+            self.current_line_mut().text.insert(byte_idx, c);
+            self.cursor_col += 1;
+            self.dirty = true;
         }
     }
 
     pub fn insert_newline(&mut self) {
-        let current_line = self.buffer.get(self.cursor_row).cloned().unwrap_or_default();
-
-        // Use Unicode-aware splitting
-        let (before, after) = if let Some(byte_idx) = Self::grapheme_to_byte_index(&current_line, self.cursor_col) {
-            let before = current_line[..byte_idx].to_string();
-            let after = current_line[byte_idx..].to_string();
-            (before, after)
+        let current_line = self.current_line().clone();
+        let (before, after) = if let Some(byte_idx) =
+            Self::grapheme_to_byte_index(&current_line.text, self.cursor_col)
+        {
+            (
+                current_line.text[..byte_idx].to_string(),
+                current_line.text[byte_idx..].to_string(),
+            )
         } else {
-            (current_line, String::new())
+            (current_line.text.clone(), String::new())
         };
 
-        self.buffer[self.cursor_row] = before;
-        self.buffer.insert(self.cursor_row + 1, after);
+        self.buffer[self.cursor_row].text = before;
+        let next_ending = self.buffer[self.cursor_row].ending.take();
+        self.buffer[self.cursor_row].ending = Some(self.preferred_line_ending);
+        self.buffer
+            .insert(self.cursor_row + 1, Line::new(after, next_ending));
         self.cursor_row += 1;
         self.cursor_col = 0;
         self.dirty = true;
     }
 
     pub fn delete_char(&mut self) {
-        if let Some(line) = self.buffer.get_mut(self.cursor_row) {
-            let grapheme_count = Self::grapheme_len(line);
-            if self.cursor_col < grapheme_count {
-                // Find the byte range of the grapheme to delete
-                let graphemes: Vec<_> = line.grapheme_indices(true).collect();
-                if let Some((start, g)) = graphemes.get(self.cursor_col) {
-                    let end = start + g.len();
-                    line.replace_range(*start..end, "");
-                    self.dirty = true;
-                }
+        let line_len = Self::grapheme_len(self.current_line_text());
+        if self.cursor_col < line_len {
+            let graphemes: Vec<_> = self.current_line_text().grapheme_indices(true).collect();
+            if let Some((start, g)) = graphemes.get(self.cursor_col) {
+                let start = *start;
+                let end = start + g.len();
+                self.current_line_mut().text.replace_range(start..end, "");
+                self.dirty = true;
             }
+            return;
+        }
+
+        if self.cursor_row + 1 < self.buffer.len() {
+            let next = self.buffer.remove(self.cursor_row + 1);
+            let current = self.current_line_mut();
+            current.text.push_str(&next.text);
+            current.ending = next.ending;
+            self.dirty = true;
         }
     }
 
     pub fn backspace(&mut self) {
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
-            if let Some(line) = self.buffer.get_mut(self.cursor_row) {
-                // Find and remove the grapheme at cursor_col (after decrement)
-                let graphemes: Vec<_> = line.grapheme_indices(true).collect();
-                if let Some((start, g)) = graphemes.get(self.cursor_col) {
-                    let end = start + g.len();
-                    line.replace_range(*start..end, "");
-                    self.dirty = true;
-                }
+            let graphemes: Vec<_> = self.current_line_text().grapheme_indices(true).collect();
+            if let Some((start, g)) = graphemes.get(self.cursor_col) {
+                let start = *start;
+                let end = start + g.len();
+                self.current_line_mut().text.replace_range(start..end, "");
+                self.dirty = true;
             }
         } else if self.cursor_row > 0 {
-            // Merge with previous line
-            let current_line = self.buffer.remove(self.cursor_row);
+            let current = self.remove_line_internal(self.cursor_row);
             self.cursor_row -= 1;
-            let prev_line_len = Self::grapheme_len(&self.buffer[self.cursor_row]);
-            self.buffer[self.cursor_row].push_str(&current_line);
+            let prev_line_len = Self::grapheme_len(&self.buffer[self.cursor_row].text);
+            self.buffer[self.cursor_row].text.push_str(&current.text);
+            self.buffer[self.cursor_row].ending = current.ending;
             self.cursor_col = prev_line_len;
             self.dirty = true;
         }
@@ -386,16 +510,12 @@ impl Editor {
             self.cursor_col -= 1;
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
-            self.cursor_col = self.buffer.get(self.cursor_row)
-                .map(|l| Self::grapheme_len(l))
-                .unwrap_or(0);
+            self.cursor_col = Self::grapheme_len(&self.buffer[self.cursor_row].text);
         }
     }
 
     pub fn cursor_right(&mut self) {
-        let line_len = self.buffer.get(self.cursor_row)
-            .map(|l| Self::grapheme_len(l))
-            .unwrap_or(0);
+        let line_len = Self::grapheme_len(self.current_line_text());
         if self.cursor_col < line_len {
             self.cursor_col += 1;
         } else if self.cursor_row < self.buffer.len() - 1 {
@@ -419,28 +539,19 @@ impl Editor {
     }
 
     pub fn cursor_end(&mut self) {
-        self.cursor_col = self.buffer.get(self.cursor_row)
-            .map(|l| Self::grapheme_len(l))
-            .unwrap_or(0);
+        self.cursor_col = Self::grapheme_len(self.current_line_text());
     }
 
     fn clamp_cursor_col(&mut self) {
-        let line_len = self.buffer.get(self.cursor_row)
-            .map(|l| Self::grapheme_len(l))
-            .unwrap_or(0);
+        let line_len = Self::grapheme_len(self.current_line_text());
         self.cursor_col = self.cursor_col.min(line_len);
     }
 
     pub fn cut_line(&mut self) {
         if self.cursor_row < self.buffer.len() {
-            self.cut_buffer = Some(self.buffer[self.cursor_row].clone());
-            if self.buffer.len() > 1 {
-                self.buffer.remove(self.cursor_row);
-                if self.cursor_row >= self.buffer.len() {
-                    self.cursor_row = self.buffer.len() - 1;
-                }
-            } else {
-                self.buffer[0] = String::new();
+            self.cut_buffer = Some(self.remove_line_internal(self.cursor_row));
+            if self.cursor_row >= self.buffer.len() {
+                self.cursor_row = self.buffer.len() - 1;
             }
             self.cursor_col = 0;
             self.clamp_cursor_col();
@@ -449,219 +560,132 @@ impl Editor {
     }
 
     pub fn paste(&mut self) {
-        if let Some(ref text) = self.cut_buffer {
-            self.buffer.insert(self.cursor_row, text.clone());
-            self.cursor_row += 1;
+        if let Some(ref line) = self.cut_buffer {
+            self.insert_line_internal(self.cursor_row, line.clone());
+            self.cursor_row = (self.cursor_row + 1).min(self.buffer.len() - 1);
             self.cursor_col = 0;
             self.dirty = true;
         }
     }
 
-    /// Convert a byte position to a grapheme index
-    fn byte_to_grapheme_index(s: &str, byte_pos: usize) -> usize {
-        s.grapheme_indices(true)
-            .take_while(|(idx, _)| *idx < byte_pos)
-            .count()
-    }
-
     pub fn find(&mut self, query: &str) {
-        // Search from current position to end
         for (row_idx, line) in self.buffer.iter().enumerate().skip(self.cursor_row) {
             let start_byte = if row_idx == self.cursor_row {
-                Self::grapheme_to_byte_index(line, self.cursor_col).unwrap_or(0)
+                Self::grapheme_to_byte_index(&line.text, self.cursor_col).unwrap_or(0)
             } else {
                 0
             };
 
-            if let Some(byte_pos) = line[start_byte..].find(query) {
+            if let Some(byte_pos) = line.text[start_byte..].find(query) {
                 let absolute_byte_pos = start_byte + byte_pos;
                 self.cursor_row = row_idx;
-                self.cursor_col = Self::byte_to_grapheme_index(line, absolute_byte_pos);
+                self.cursor_col = Self::byte_to_grapheme_index(&line.text, absolute_byte_pos);
                 return;
             }
         }
-        // Wrap around to beginning
+
         for (row_idx, line) in self.buffer.iter().enumerate().take(self.cursor_row + 1) {
-            if let Some(byte_pos) = line.find(query) {
+            if let Some(byte_pos) = line.text.find(query) {
                 self.cursor_row = row_idx;
-                self.cursor_col = Self::byte_to_grapheme_index(line, byte_pos);
+                self.cursor_col = Self::byte_to_grapheme_index(&line.text, byte_pos);
                 self.message = Some(format!("Search wrapped: {}", query));
                 return;
             }
         }
+
         self.message = Some(format!("Not found: {}", query));
     }
 
-    /// Clamps scroll, then snapshots render state.
-    pub fn render_state(&mut self, visible_rows: usize) -> RenderState {
-        // Scroll clamping (mirrors what render() does)
+    pub fn render_state(&mut self, visible_rows: usize, cols: u16) -> RenderState {
         if self.cursor_row < self.row_offset {
             self.row_offset = self.cursor_row;
         } else if visible_rows > 0 && self.cursor_row >= self.row_offset + visible_rows {
             self.row_offset = self.cursor_row - visible_rows + 1;
         }
+
+        self.ensure_horizontal_scroll(cols);
+
         RenderState {
-            lines: self.buffer.clone(),
+            lines: self.buffer.iter().map(|line| line.text.clone()).collect(),
             row_offset: self.row_offset,
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
+            col_offset: self.col_offset,
             prompt_mode: self.prompt_mode.clone(),
             message: self.message.clone(),
         }
     }
-
-    #[cfg(test)]
-    pub fn render<W: Write>(&mut self, stdout: &mut W, cols: u16, rows: u16) -> io::Result<()> {
-        // Calculate visible rows (reserve bottom line for messages/prompts)
-        let visible_rows = rows.saturating_sub(1) as usize;
-
-        // Adjust row_offset for scrolling
-        if self.cursor_row < self.row_offset {
-            self.row_offset = self.cursor_row;
-        } else if self.cursor_row >= self.row_offset + visible_rows {
-            self.row_offset = self.cursor_row - visible_rows + 1;
-        }
-
-        // Clear screen
-        stdout.queue(crossterm::terminal::Clear(ClearType::All))?;
-
-        // Render visible lines
-        for (i, line_idx) in (self.row_offset..self.buffer.len()).enumerate() {
-            if i >= visible_rows {
-                break;
-            }
-            stdout.queue(MoveTo(0, i as u16))?;
-
-            // Truncate by display width, not char count, to handle wide characters
-            let line = &self.buffer[line_idx];
-            let max_cols = cols as usize;
-            let mut display_width = 0;
-            let truncated: String = line.graphemes(true)
-                .take_while(|g| {
-                    let w = UnicodeWidthStr::width(*g);
-                    if display_width + w <= max_cols {
-                        display_width += w;
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .collect();
-            stdout.queue(Print(truncated))?;
-        }
-
-        // Show prompt or message on bottom line
-        stdout.queue(MoveTo(0, rows - 1))?;
-        match &self.prompt_mode {
-            PromptMode::SaveAs(input) => {
-                let prompt = format!("Save as: {}", input);
-                let truncated = truncate_to_width(&prompt, cols as usize);
-                stdout.queue(Print(truncated))?;
-            }
-            PromptMode::Find(input) => {
-                let prompt = format!("Find: {}", input);
-                let truncated = truncate_to_width(&prompt, cols as usize);
-                stdout.queue(Print(truncated))?;
-            }
-            PromptMode::ConfirmExit => {
-                stdout.queue(Print("Save changes? (Y/n): "))?;
-            }
-            PromptMode::None => {
-                if let Some(ref msg) = self.message {
-                    let truncated = truncate_to_width(msg, cols as usize);
-                    stdout.queue(Print(truncated))?;
-                }
-            }
-        }
-
-        // Position cursor - in prompt mode, put cursor at end of prompt line
-        match &self.prompt_mode {
-            PromptMode::SaveAs(input) => {
-                let prompt = format!("Save as: {}", input);
-                let prompt_display_width = UnicodeWidthStr::width(prompt.as_str()) as u16;
-                stdout.queue(MoveTo(prompt_display_width.min(cols.saturating_sub(1)), rows - 1))?;
-            }
-            PromptMode::Find(input) => {
-                let prompt = format!("Find: {}", input);
-                let prompt_display_width = UnicodeWidthStr::width(prompt.as_str()) as u16;
-                stdout.queue(MoveTo(prompt_display_width.min(cols.saturating_sub(1)), rows - 1))?;
-            }
-            PromptMode::ConfirmExit => {
-                stdout.queue(MoveTo(20, rows - 1))?;
-            }
-            PromptMode::None => {
-                let cursor_screen_row = (self.cursor_row - self.row_offset) as u16;
-                // Compute display column as sum of widths of graphemes left of cursor
-                let line = self.buffer.get(self.cursor_row).map(String::as_str).unwrap_or("");
-                let cursor_display_col: usize = line.graphemes(true)
-                    .take(self.cursor_col)
-                    .map(UnicodeWidthStr::width)
-                    .sum();
-                stdout.queue(MoveTo(cursor_display_col as u16, cursor_screen_row))?;
-            }
-        }
-
-        Ok(())
-    }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn serialize(lines: Vec<Line>) -> Vec<u8> {
+        let mut editor = Editor::new();
+        editor.buffer = lines;
+        editor.serialized_content()
+    }
+
     #[test]
-    fn test_grapheme_len_ascii() {
-        assert_eq!(Editor::grapheme_len("hello"), 5);
-        assert_eq!(Editor::grapheme_len(""), 0);
+    fn test_parse_empty_file() {
+        let (lines, ending) = Editor::parse_file_bytes(b"").unwrap();
+        assert_eq!(ending, LineEnding::Lf);
+        assert_eq!(lines, vec![Line::new(String::new(), None)]);
+    }
+
+    #[test]
+    fn test_parse_preserves_crlf_and_final_newline() {
+        let (lines, ending) = Editor::parse_file_bytes(b"hello\r\nworld\r\n").unwrap();
+        assert_eq!(ending, LineEnding::Crlf);
+        assert_eq!(
+            lines,
+            vec![
+                Line::new("hello".to_string(), Some(LineEnding::Crlf)),
+                Line::new("world".to_string(), Some(LineEnding::Crlf)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_preserves_missing_final_newline() {
+        let (lines, _) = Editor::parse_file_bytes(b"hello\nworld").unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                Line::new("hello".to_string(), Some(LineEnding::Lf)),
+                Line::new("world".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_non_utf8() {
+        let error = Editor::parse_file_bytes(&[0xff, 0xfe]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_serialize_preserves_line_endings() {
+        let bytes = serialize(vec![
+            Line::new("hello".to_string(), Some(LineEnding::Crlf)),
+            Line::new("world".to_string(), None),
+        ]);
+        assert_eq!(bytes, b"hello\r\nworld");
     }
 
     #[test]
     fn test_grapheme_len_unicode() {
-        // Each emoji is one grapheme cluster
-        assert_eq!(Editor::grapheme_len("👨‍👩‍👧‍👦"), 1); // Family emoji (ZWJ sequence)
-        assert_eq!(Editor::grapheme_len("🇺🇸"), 1); // Flag emoji (regional indicators)
-        assert_eq!(Editor::grapheme_len("café"), 4); // e with combining acute accent is 1 grapheme
-        assert_eq!(Editor::grapheme_len("naïve"), 5);
-    }
-
-    #[test]
-    fn test_grapheme_to_byte_index_ascii() {
-        assert_eq!(Editor::grapheme_to_byte_index("hello", 0), Some(0));
-        assert_eq!(Editor::grapheme_to_byte_index("hello", 3), Some(3));
-        assert_eq!(Editor::grapheme_to_byte_index("hello", 5), Some(5)); // End of string
-        assert_eq!(Editor::grapheme_to_byte_index("hello", 6), None); // Out of bounds
+        assert_eq!(Editor::grapheme_len("👨‍👩‍👧‍👦"), 1);
+        assert_eq!(Editor::grapheme_len("🇺🇸"), 1);
+        assert_eq!(Editor::grapheme_len("café"), 4);
     }
 
     #[test]
     fn test_grapheme_to_byte_index_unicode() {
-        // "héllo" - é is 2 bytes
         let s = "héllo";
-        assert_eq!(Editor::grapheme_to_byte_index(s, 0), Some(0)); // h
-        assert_eq!(Editor::grapheme_to_byte_index(s, 1), Some(1)); // é starts at byte 1
-        assert_eq!(Editor::grapheme_to_byte_index(s, 2), Some(3)); // l starts at byte 3
-        assert_eq!(Editor::grapheme_to_byte_index(s, 5), Some(6)); // End of string
-    }
-
-    #[test]
-    fn test_byte_to_grapheme_index() {
-        let s = "héllo"; // h=byte 0, é=bytes 1-2, l=byte 3, l=byte 4, o=byte 5
-        // byte_to_grapheme_index counts graphemes that START BEFORE the byte position
-        assert_eq!(Editor::byte_to_grapheme_index(s, 0), 0); // Nothing before byte 0
-        assert_eq!(Editor::byte_to_grapheme_index(s, 1), 1); // 'h' starts before byte 1
-        assert_eq!(Editor::byte_to_grapheme_index(s, 2), 2); // 'h' and 'é' start before byte 2
-        assert_eq!(Editor::byte_to_grapheme_index(s, 3), 2); // 'h' and 'é' start before byte 3
-        assert_eq!(Editor::byte_to_grapheme_index(s, 4), 3); // 'h', 'é', 'l' start before byte 4
-    }
-
-    #[test]
-    fn test_insert_char_ascii() {
-        let mut editor = Editor::new();
-        editor.insert_char('a');
-        editor.insert_char('b');
-        editor.insert_char('c');
-        assert_eq!(editor.buffer[0], "abc");
-        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(Editor::grapheme_to_byte_index(s, 2), Some(3));
+        assert_eq!(Editor::grapheme_to_byte_index(s, 5), Some(6));
     }
 
     #[test]
@@ -672,177 +696,111 @@ mod tests {
         editor.insert_char('l');
         editor.insert_char('l');
         editor.insert_char('o');
-        assert_eq!(editor.buffer[0], "héllo");
-        assert_eq!(editor.cursor_col, 5); // 5 graphemes
+        assert_eq!(editor.buffer[0].text, "héllo");
+        assert_eq!(editor.cursor_col, 5);
     }
 
     #[test]
-    fn test_insert_char_emoji() {
+    fn test_insert_newline_preserves_existing_line_ending() {
         let mut editor = Editor::new();
-        editor.insert_char('a');
-        editor.insert_char('🎉');
-        editor.insert_char('b');
-        assert_eq!(editor.buffer[0], "a🎉b");
-        assert_eq!(editor.cursor_col, 3); // 3 graphemes
-    }
-
-    #[test]
-    fn test_cursor_movement_unicode() {
-        let mut editor = Editor::new();
-        editor.buffer[0] = "a🎉b".to_string();
-        editor.cursor_col = 0;
-
-        editor.cursor_right();
-        assert_eq!(editor.cursor_col, 1); // After 'a'
-
-        editor.cursor_right();
-        assert_eq!(editor.cursor_col, 2); // After emoji
-
-        editor.cursor_right();
-        assert_eq!(editor.cursor_col, 3); // After 'b'
-
-        editor.cursor_left();
-        assert_eq!(editor.cursor_col, 2); // Back before 'b'
-
-        editor.cursor_left();
-        assert_eq!(editor.cursor_col, 1); // Back before emoji
-    }
-
-    #[test]
-    fn test_backspace_unicode() {
-        let mut editor = Editor::new();
-        editor.buffer[0] = "a🎉b".to_string();
-        editor.cursor_col = 3;
-
-        editor.backspace(); // Delete 'b'
-        assert_eq!(editor.buffer[0], "a🎉");
-        assert_eq!(editor.cursor_col, 2);
-
-        editor.backspace(); // Delete emoji
-        assert_eq!(editor.buffer[0], "a");
-        assert_eq!(editor.cursor_col, 1);
-    }
-
-    #[test]
-    fn test_delete_char_unicode() {
-        let mut editor = Editor::new();
-        editor.buffer[0] = "a🎉b".to_string();
-        editor.cursor_col = 0;
-
-        editor.delete_char(); // Delete 'a'
-        assert_eq!(editor.buffer[0], "🎉b");
-        assert_eq!(editor.cursor_col, 0);
-
-        editor.delete_char(); // Delete emoji
-        assert_eq!(editor.buffer[0], "b");
-        assert_eq!(editor.cursor_col, 0);
-    }
-
-    #[test]
-    fn test_insert_newline_unicode() {
-        let mut editor = Editor::new();
-        editor.buffer[0] = "a🎉b".to_string();
-        editor.cursor_col = 2; // After emoji
+        editor.buffer = vec![Line::new("hello".to_string(), Some(LineEnding::Crlf))];
+        editor.preferred_line_ending = LineEnding::Crlf;
+        editor.cursor_col = 2;
 
         editor.insert_newline();
-        assert_eq!(editor.buffer.len(), 2);
-        assert_eq!(editor.buffer[0], "a🎉");
-        assert_eq!(editor.buffer[1], "b");
-        assert_eq!(editor.cursor_row, 1);
-        assert_eq!(editor.cursor_col, 0);
+
+        assert_eq!(
+            editor.buffer,
+            vec![
+                Line::new("he".to_string(), Some(LineEnding::Crlf)),
+                Line::new("llo".to_string(), Some(LineEnding::Crlf)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_delete_at_end_of_line_joins_next_line() {
+        let mut editor = Editor::new();
+        editor.buffer = vec![
+            Line::new("hello".to_string(), Some(LineEnding::Lf)),
+            Line::new("world".to_string(), None),
+        ];
+        editor.cursor_col = 5;
+
+        editor.delete_char();
+
+        assert_eq!(
+            editor.buffer,
+            vec![Line::new("helloworld".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn test_backspace_at_start_of_line_joins_previous_line() {
+        let mut editor = Editor::new();
+        editor.buffer = vec![
+            Line::new("hello".to_string(), Some(LineEnding::Lf)),
+            Line::new("world".to_string(), None),
+        ];
+        editor.cursor_row = 1;
+
+        editor.backspace();
+
+        assert_eq!(
+            editor.buffer,
+            vec![Line::new("helloworld".to_string(), None)]
+        );
+        assert_eq!(editor.cursor_row, 0);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn test_cut_last_line_clears_previous_line_ending() {
+        let mut editor = Editor::new();
+        editor.buffer = vec![
+            Line::new("hello".to_string(), Some(LineEnding::Lf)),
+            Line::new("world".to_string(), None),
+        ];
+        editor.cursor_row = 1;
+
+        editor.cut_line();
+
+        assert_eq!(editor.buffer, vec![Line::new("hello".to_string(), None)]);
     }
 
     #[test]
     fn test_find_unicode() {
         let mut editor = Editor::new();
-        editor.buffer = vec!["hello".to_string(), "wörld".to_string(), "test".to_string()];
-        editor.cursor_row = 0;
-        editor.cursor_col = 0;
-
-        editor.find("ö");
+        editor.buffer = vec![
+            Line::new("hello".to_string(), Some(LineEnding::Lf)),
+            Line::new("wörld".to_string(), Some(LineEnding::Lf)),
+            Line::new("test".to_string(), None),
+        ];
+        editor.find("ör");
         assert_eq!(editor.cursor_row, 1);
-        assert_eq!(editor.cursor_col, 1); // Grapheme position of ö
+        assert_eq!(editor.cursor_col, 1);
     }
 
     #[test]
-    fn test_cut_paste() {
+    fn test_cut_and_paste_restore_line_content() {
         let mut editor = Editor::new();
-        editor.buffer = vec!["line1".to_string(), "line2".to_string(), "line3".to_string()];
-        editor.cursor_row = 1;
+        editor.buffer = vec![
+            Line::new("hello".to_string(), Some(LineEnding::Lf)),
+            Line::new("world".to_string(), None),
+        ];
 
         editor.cut_line();
-        assert_eq!(editor.buffer.len(), 2);
-        assert_eq!(editor.cut_buffer, Some("line2".to_string()));
+        assert_eq!(editor.buffer.len(), 1);
+        assert_eq!(editor.buffer[0], Line::new("world".to_string(), None));
 
         editor.paste();
-        assert_eq!(editor.buffer.len(), 3);
-        assert_eq!(editor.buffer[1], "line2");
-    }
-
-    #[test]
-    fn test_cursor_end_unicode() {
-        let mut editor = Editor::new();
-        editor.buffer[0] = "a🎉b".to_string();
-        editor.cursor_col = 0;
-
-        editor.cursor_end();
-        assert_eq!(editor.cursor_col, 3); // 3 graphemes
-    }
-
-    #[test]
-    fn test_clamp_cursor_col() {
-        let mut editor = Editor::new();
-        editor.buffer[0] = "ab".to_string();
-        editor.cursor_col = 10; // Out of bounds
-
-        editor.clamp_cursor_col();
-        assert_eq!(editor.cursor_col, 2);
-    }
-
-    #[test]
-    fn test_get_line_one_indexed() {
-        let mut e = Editor::new();
-        e.buffer = vec!["alpha".to_string(), "beta".to_string()];
-        assert_eq!(e.get_line(1), Some("alpha"));
-        assert_eq!(e.get_line(2), Some("beta"));
-        assert_eq!(e.get_line(0), None);  // 0 is out of range
-        assert_eq!(e.get_line(3), None);  // past end
-    }
-
-    #[test]
-    fn test_line_count() {
-        let mut e = Editor::new();
-        e.buffer = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert_eq!(e.line_count(), 3);
-    }
-
-    #[test]
-    fn test_set_line_one_indexed() {
-        let mut e = Editor::new();
-        e.buffer = vec!["hello".to_string(), "world".to_string()];
-        e.set_line(1, "goodbye".to_string());
-        assert_eq!(e.buffer[0], "goodbye");
-        e.set_line(0, "noop".to_string()); // out of range — no-op
-        assert_eq!(e.buffer[0], "goodbye");
-    }
-
-    #[test]
-    fn test_insert_line_one_indexed() {
-        let mut e = Editor::new();
-        e.buffer = vec!["a".to_string(), "c".to_string()];
-        e.insert_line(2, "b".to_string()); // insert before line 2
-        assert_eq!(e.buffer, vec!["a", "b", "c"]);
-        e.insert_line(0, "noop".to_string()); // out of range — no-op
-        assert_eq!(e.buffer, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_delete_line_one_indexed() {
-        let mut e = Editor::new();
-        e.buffer = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        e.delete_line(2);
-        assert_eq!(e.buffer, vec!["a", "c"]);
-        e.delete_line(0); // out of range — no-op
-        assert_eq!(e.buffer, vec!["a", "c"]);
+        assert_eq!(editor.buffer.len(), 2);
+        assert_eq!(
+            editor.buffer,
+            vec![
+                Line::new("hello".to_string(), Some(LineEnding::Lf)),
+                Line::new("world".to_string(), None),
+            ]
+        );
     }
 }

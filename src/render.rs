@@ -1,11 +1,6 @@
 use std::io::Write;
 
-use crossterm::{
-    cursor::MoveTo,
-    style::Print,
-    terminal::ClearType,
-    QueueableCommand,
-};
+use crossterm::{cursor::MoveTo, style::Print, terminal::ClearType, QueueableCommand};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -18,81 +13,116 @@ pub fn render_frame<W: Write>(
     rows: u16,
 ) -> std::io::Result<()> {
     let visible_rows = rows.saturating_sub(1) as usize;
+    let status_row = rows - 1;
+    let max_cols = cols as usize;
 
-    // Clear screen
     stdout.queue(crossterm::terminal::Clear(ClearType::All))?;
 
-    // Render visible lines
     for (i, line_idx) in (state.row_offset..state.lines.len()).enumerate() {
         if i >= visible_rows {
             break;
         }
         stdout.queue(MoveTo(0, i as u16))?;
         let line = &state.lines[line_idx];
-        let max_cols = cols as usize;
-        let mut display_width = 0;
-        let truncated: String = line.graphemes(true)
-            .take_while(|g| {
-                let w = UnicodeWidthStr::width(*g);
-                if display_width + w <= max_cols {
-                    display_width += w;
-                    true
-                } else {
-                    false
-                }
-            })
-            .collect();
+        let truncated = visible_line(line, state.col_offset, max_cols);
         stdout.queue(Print(truncated))?;
     }
 
-    // Status bar / prompt
-    stdout.queue(MoveTo(0, rows - 1))?;
-    match &state.prompt_mode {
-        PromptMode::SaveAs(input) => {
-            let prompt = format!("Save as: {}", input);
-            stdout.queue(Print(truncate_to_width(&prompt, cols as usize)))?;
-        }
-        PromptMode::Find(input) => {
-            let prompt = format!("Find: {}", input);
-            stdout.queue(Print(truncate_to_width(&prompt, cols as usize)))?;
-        }
-        PromptMode::ConfirmExit => {
-            stdout.queue(Print("Save changes? (Y/n): "))?;
-        }
-        PromptMode::None => {
-            if let Some(ref msg) = state.message {
-                stdout.queue(Print(truncate_to_width(msg, cols as usize)))?;
-            }
-        }
+    stdout.queue(MoveTo(0, status_row))?;
+    if let Some(prompt) = status_text(&state.prompt_mode) {
+        stdout.queue(Print(truncate_to_width(&prompt, max_cols)))?;
+    } else if let Some(ref msg) = state.message {
+        stdout.queue(Print(truncate_to_width(msg, max_cols)))?;
     }
 
-    // Cursor position
     match &state.prompt_mode {
-        PromptMode::SaveAs(input) => {
-            let prompt = format!("Save as: {}", input);
+        PromptMode::SaveAs(_) | PromptMode::Find(_) => {
+            let prompt = prompt_text(&state.prompt_mode).expect("prompt mode");
             let w = UnicodeWidthStr::width(prompt.as_str()) as u16;
-            stdout.queue(MoveTo(w.min(cols.saturating_sub(1)), rows - 1))?;
-        }
-        PromptMode::Find(input) => {
-            let prompt = format!("Find: {}", input);
-            let w = UnicodeWidthStr::width(prompt.as_str()) as u16;
-            stdout.queue(MoveTo(w.min(cols.saturating_sub(1)), rows - 1))?;
+            stdout.queue(MoveTo(w.min(cols.saturating_sub(1)), status_row))?;
         }
         PromptMode::ConfirmExit => {
-            stdout.queue(MoveTo(20, rows - 1))?;
+            stdout.queue(MoveTo(20, status_row))?;
         }
         PromptMode::None => {
             let screen_row = (state.cursor_row - state.row_offset) as u16;
-            let line = state.lines.get(state.cursor_row).map(String::as_str).unwrap_or("");
-            let display_col: usize = line.graphemes(true)
-                .take(state.cursor_col)
-                .map(UnicodeWidthStr::width)
-                .sum();
-            stdout.queue(MoveTo(display_col as u16, screen_row))?;
+            let line = state
+                .lines
+                .get(state.cursor_row)
+                .map(String::as_str)
+                .unwrap_or("");
+            let cursor_x = cursor_screen_x(line, state.cursor_col, state.col_offset, max_cols);
+            stdout.queue(MoveTo(cursor_x.min(cols.saturating_sub(1)), screen_row))?;
         }
     }
 
     stdout.flush()
+}
+
+fn visible_line(line: &str, col_offset: usize, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+
+    let total_width = line
+        .graphemes(true)
+        .map(UnicodeWidthStr::width)
+        .sum::<usize>();
+    let left_marker = col_offset > 0;
+    let mut text_width = max_cols.saturating_sub(usize::from(left_marker));
+    let right_marker = total_width > col_offset + text_width;
+    if right_marker {
+        text_width = text_width.saturating_sub(1);
+    }
+
+    let mut rendered = String::new();
+    if left_marker {
+        rendered.push('<');
+    }
+
+    let mut consumed_width = 0;
+    let mut visible_width = 0;
+    for grapheme in line.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if consumed_width + width <= col_offset {
+            consumed_width += width;
+            continue;
+        }
+        if visible_width + width > text_width {
+            break;
+        }
+        rendered.push_str(grapheme);
+        visible_width += width;
+    }
+
+    if right_marker {
+        rendered.push('>');
+    }
+
+    rendered
+}
+
+fn cursor_screen_x(line: &str, cursor_col: usize, col_offset: usize, max_cols: usize) -> u16 {
+    let total_width = line
+        .graphemes(true)
+        .map(UnicodeWidthStr::width)
+        .sum::<usize>();
+    let left_marker = col_offset > 0;
+    let mut text_width = max_cols.saturating_sub(usize::from(left_marker));
+    let right_marker = total_width > col_offset + text_width;
+    if right_marker {
+        text_width = text_width.saturating_sub(1);
+    }
+
+    let cursor_width: usize = line
+        .graphemes(true)
+        .take(cursor_col)
+        .map(UnicodeWidthStr::width)
+        .sum();
+
+    let relative_x = cursor_width.saturating_sub(col_offset);
+    let left_padding = usize::from(left_marker);
+    (left_padding + relative_x.min(text_width.saturating_sub(1))) as u16
 }
 
 fn truncate_to_width(s: &str, max_cols: usize) -> String {
@@ -108,4 +138,21 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
             }
         })
         .collect()
+}
+
+fn prompt_text(prompt_mode: &PromptMode) -> Option<String> {
+    match prompt_mode {
+        PromptMode::SaveAs(input) => Some(format!("Save as: {}", input)),
+        PromptMode::Find(input) => Some(format!("Find: {}", input)),
+        PromptMode::ConfirmExit | PromptMode::None => None,
+    }
+}
+
+fn status_text(prompt_mode: &PromptMode) -> Option<String> {
+    match prompt_mode {
+        PromptMode::SaveAs(input) => Some(format!("Save as: {}", input)),
+        PromptMode::Find(input) => Some(format!("Find: {}", input)),
+        PromptMode::ConfirmExit => Some("Save changes? (Y/n): ".to_string()),
+        PromptMode::None => None,
+    }
 }
