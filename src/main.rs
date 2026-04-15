@@ -4,6 +4,7 @@ mod render;
 
 use std::env;
 use std::io;
+use std::process;
 
 use crossterm::{
     event::read,
@@ -24,7 +25,14 @@ enum StartupMode {
     Version,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(message) = run() {
+        eprintln!("{message}");
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
     let startup = parse_args(env::args())?;
     match startup {
         StartupMode::Help => {
@@ -44,9 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Enter raw terminal mode
-    terminal::enable_raw_mode()?;
+    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen).map_err(|e| e.to_string())?;
 
     // Ensure terminal is restored on exit (even on panic)
     defer! {
@@ -62,13 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // New file — pre-set the filename so Ctrl+S saves to the right place
                 editor.set_filename(path);
             } else {
-                return Err(format!("Failed to load '{}': {}", path, e).into());
+                return Err(format!("Failed to load '{}': {}", path, e));
             }
         }
     }
 
     // Event loop
-    run_event_loop(&mut editor)
+    run_event_loop(&mut editor).map_err(|e| e.to_string())
 }
 
 fn parse_args<I>(args: I) -> Result<StartupMode, String>
@@ -84,7 +92,7 @@ where
         if parsing_flags {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(StartupMode::Help),
-                "-V" | "--version" => return Ok(StartupMode::Version),
+                "-V" | "--version" | "--V" | "--v" => return Ok(StartupMode::Version),
                 "--" => {
                     parsing_flags = false;
                     continue;
@@ -261,6 +269,8 @@ mod tests {
     fn parses_version_flag() {
         assert!(matches!(parse(&["un", "--version"]), Ok(StartupMode::Version)));
         assert!(matches!(parse(&["un", "-V"]), Ok(StartupMode::Version)));
+        assert!(matches!(parse(&["un", "--V"]), Ok(StartupMode::Version)));
+        assert!(matches!(parse(&["un", "--v"]), Ok(StartupMode::Version)));
     }
 
     #[test]
