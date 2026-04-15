@@ -3,7 +3,7 @@ mod input;
 mod render;
 
 use std::env;
-use std::io::{self, Write};
+use std::io;
 
 use crossterm::{
     event::read,
@@ -13,7 +13,7 @@ use crossterm::{
 use scopeguard::defer;
 
 use editor::Editor;
-use input::{Action, handle_input};
+use input::{handle_input, Action};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -130,9 +130,7 @@ fn run_event_loop(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>>
             Action::End => editor.cursor_end(),
             Action::SaveAs => {
                 if editor.has_custom_filename() {
-                    if let Err(e) = editor.save() {
-                        editor.message = Some(format!("Error saving: {}", e));
-                    }
+                    let _ = save_with_message(editor);
                 } else {
                     editor.start_save_as_prompt();
                 }
@@ -152,9 +150,7 @@ fn run_event_loop(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>>
             Action::ExitConfirmed => break,
             Action::SaveAndExit => {
                 if editor.get_filename().is_some() {
-                    if let Err(e) = editor.save() {
-                        editor.message = Some(format!("Error saving: {}", e));
-                    } else {
+                    if save_with_message(editor) {
                         break;
                     }
                 } else {
@@ -176,4 +172,14 @@ fn run_event_loop(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>>
     }
 
     Ok(())
+}
+
+fn save_with_message(editor: &mut Editor) -> bool {
+    match editor.save() {
+        Ok(()) => true,
+        Err(e) => {
+            editor.message = Some(format!("Error saving: {}", e));
+            false
+        }
+    }
 }
