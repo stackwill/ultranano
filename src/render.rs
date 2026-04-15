@@ -32,7 +32,7 @@ pub fn render_frame<W: Write>(
 
     // Status bar / prompt
     stdout.queue(MoveTo(0, status_row))?;
-    if let Some(prompt) = prompt_text(&state.prompt_mode) {
+    if let Some(prompt) = status_text(&state.prompt_mode) {
         stdout.queue(Print(truncate_to_width(&prompt, max_cols)))?;
     } else if let Some(ref msg) = state.message {
         stdout.queue(Print(truncate_to_width(msg, max_cols)))?;
@@ -87,5 +87,14 @@ fn prompt_text(prompt_mode: &PromptMode) -> Option<String> {
         PromptMode::SaveAs(input) => Some(format!("Save as: {}", input)),
         PromptMode::Find(input) => Some(format!("Find: {}", input)),
         PromptMode::ConfirmExit | PromptMode::None => None,
+    }
+}
+
+fn status_text(prompt_mode: &PromptMode) -> Option<String> {
+    match prompt_mode {
+        PromptMode::SaveAs(input) => Some(format!("Save as: {}", input)),
+        PromptMode::Find(input) => Some(format!("Find: {}", input)),
+        PromptMode::ConfirmExit => Some("Save changes? (Y/n): ".to_string()),
+        PromptMode::None => None,
     }
 }
