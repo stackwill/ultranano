@@ -53,12 +53,13 @@ impl Line {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PromptMode {
     None,
     SaveAs(String),
     Find(String),
     ConfirmExit,
+    Help(usize),
 }
 
 pub struct RenderState {
@@ -88,6 +89,17 @@ pub struct Editor {
 }
 
 impl Editor {
+    const HELP_ITEMS: [&str; 8] = [
+        "Esc Close",
+        "^S Save",
+        "^X Exit",
+        "^W Find",
+        "^K Cut",
+        "^U Paste",
+        "Arrows Move",
+        "PgUp/PgDn Scroll",
+    ];
+
     fn grapheme_len(s: &str) -> usize {
         s.graphemes(true).count()
     }
@@ -361,11 +373,71 @@ impl Editor {
         self.prompt_mode = PromptMode::Find(String::new());
     }
 
+    pub fn toggle_help(&mut self) {
+        self.prompt_mode = match self.prompt_mode {
+            PromptMode::Help(page) => PromptMode::Help(page + 1),
+            _ => PromptMode::Help(0),
+        };
+    }
+
+    pub fn dismiss_help(&mut self) {
+        if matches!(self.prompt_mode, PromptMode::Help(_)) {
+            self.prompt_mode = PromptMode::None;
+        }
+    }
+
+    pub fn help_pages(max_cols: usize) -> Vec<String> {
+        fn pack(items: &[&str], max_cols: usize) -> Vec<String> {
+            if max_cols == 0 {
+                return vec![String::new()];
+            }
+
+            let mut pages = Vec::new();
+            let mut current = String::new();
+            let mut current_width = 0;
+
+            for item in items {
+                let item_width = UnicodeWidthStr::width(*item);
+                let separator_width = if current.is_empty() { 0 } else { 2 };
+                if !current.is_empty() && current_width + separator_width + item_width > max_cols {
+                    pages.push(current);
+                    current = String::new();
+                    current_width = 0;
+                }
+
+                if !current.is_empty() {
+                    current.push_str("  ");
+                    current_width += 2;
+                }
+                current.push_str(item);
+                current_width += item_width;
+            }
+
+            if !current.is_empty() {
+                pages.push(current);
+            }
+
+            if pages.is_empty() {
+                pages.push(String::new());
+            }
+
+            pages
+        }
+
+        let mut pages = pack(&Self::HELP_ITEMS, max_cols);
+        if pages.len() > 1 {
+            let mut paged_items = vec!["^H Next"];
+            paged_items.extend(Self::HELP_ITEMS);
+            pages = pack(&paged_items, max_cols);
+        }
+        pages
+    }
+
     pub fn prompt_insert_char(&mut self, c: char) {
         match &mut self.prompt_mode {
             PromptMode::SaveAs(ref mut input) => input.push(c),
             PromptMode::Find(ref mut input) => input.push(c),
-            PromptMode::None | PromptMode::ConfirmExit => {}
+            PromptMode::None | PromptMode::ConfirmExit | PromptMode::Help(_) => {}
         }
     }
 
@@ -377,7 +449,7 @@ impl Editor {
             PromptMode::Find(ref mut input) => {
                 input.pop();
             }
-            PromptMode::None | PromptMode::ConfirmExit => {}
+            PromptMode::None | PromptMode::ConfirmExit | PromptMode::Help(_) => {}
         }
     }
 
@@ -412,7 +484,7 @@ impl Editor {
                 }
                 true
             }
-            PromptMode::None | PromptMode::ConfirmExit => false,
+            PromptMode::None | PromptMode::ConfirmExit | PromptMode::Help(_) => false,
         }
     }
 
@@ -802,5 +874,32 @@ mod tests {
                 Line::new("world".to_string(), None),
             ]
         );
+    }
+
+    #[test]
+    fn test_help_cycles_pages() {
+        let wide_pages = Editor::help_pages(120);
+        let narrow_pages = Editor::help_pages(32);
+
+        assert_eq!(wide_pages.len(), 1);
+        assert!(!wide_pages[0].contains("^H Next"));
+        assert!(narrow_pages.len() > 1);
+        assert!(narrow_pages[0].contains("^H Next"));
+    }
+
+    #[test]
+    fn test_dismiss_help_returns_to_normal() {
+        let mut editor = Editor::new();
+        editor.toggle_help();
+        editor.dismiss_help();
+        assert_eq!(editor.prompt_mode, PromptMode::None);
+    }
+
+    #[test]
+    fn test_help_page_index_wraps_by_render_width() {
+        let pages = Editor::help_pages(32);
+        assert!(pages.len() > 1);
+        let wrapped = &pages[pages.len() % pages.len()];
+        assert_eq!(wrapped, &pages[0]);
     }
 }

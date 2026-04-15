@@ -20,6 +20,8 @@ pub enum Action {
     Find,
     Cut,
     Paste,
+    Help,
+    DismissHelp,
     Exit,
     // Prompt mode actions
     PromptInsert(char),
@@ -36,6 +38,7 @@ pub fn handle_input(event: Event, prompt_mode: &PromptMode) -> Action {
         match prompt_mode {
             PromptMode::None => handle_key_normal(key),
             PromptMode::ConfirmExit => handle_key_confirm_exit(key),
+            PromptMode::Help(_) => handle_key_help(key),
             _ => handle_key_prompt(key),
         }
     } else {
@@ -52,6 +55,7 @@ fn handle_key_normal(key: KeyEvent) -> Action {
             Char('x') | Char('X') => Action::Exit,
             Char('s') | Char('S') => Action::SaveAs,
             Char('w') | Char('W') => Action::Find,
+            Char('h') | Char('H') | Backspace => Action::Help,
             Char('k') | Char('K') => Action::Cut,
             Char('u') | Char('U') => Action::Paste,
             _ => Action::None,
@@ -72,8 +76,24 @@ fn handle_key_normal(key: KeyEvent) -> Action {
         PageDown => Action::PageDown,
         Home => Action::Home,
         End => Action::End,
-        Esc => Action::None,  // Could be used for something
+        Esc => Action::None, // Could be used for something
         Tab => Action::Insert('\t'),
+        _ => Action::None,
+    }
+}
+
+fn handle_key_help(key: KeyEvent) -> Action {
+    use crossterm::event::KeyCode::*;
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            Char('h') | Char('H') | Backspace => Action::Help,
+            _ => Action::None,
+        };
+    }
+
+    match key.code {
+        Esc => Action::DismissHelp,
         _ => Action::None,
     }
 }

@@ -36,6 +36,7 @@ un <filename>
 | Ctrl+X | Exit editor |
 | Ctrl+S | Save as (set filename) |
 | Ctrl+W | Find text |
+| Ctrl+H | Cycle inline help |
 | Ctrl+K | Cut current line |
 | Ctrl+U | Paste cut line |
 | Arrow keys | Move cursor |
@@ -51,6 +52,12 @@ In prompts:
 |-----|--------|
 | Enter | Submit |
 | Esc | Cancel |
+
+In help:
+| Key | Action |
+|-----|--------|
+| Ctrl+H | Next help page |
+| Esc | Close help |
 
 ## Uninstallation
 

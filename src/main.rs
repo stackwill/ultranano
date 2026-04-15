@@ -64,6 +64,7 @@ fn print_help() {
     println!("  Ctrl+X         Exit editor");
     println!("  Ctrl+S         Save / Save as");
     println!("  Ctrl+W         Find text");
+    println!("  Ctrl+H         Help");
     println!("  Ctrl+K         Cut current line");
     println!("  Ctrl+U         Paste cut line");
     println!("  Arrow keys     Move cursor");
@@ -138,6 +139,8 @@ fn run_event_loop(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>>
             Action::Find => {
                 editor.start_find_prompt();
             }
+            Action::Help => editor.toggle_help(),
+            Action::DismissHelp => editor.dismiss_help(),
             Action::Cut => editor.cut_line(),
             Action::Paste => editor.paste(),
             Action::Exit => {
