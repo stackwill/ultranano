@@ -2,14 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crossterm::{
-    cursor::MoveTo,
-    style::Print,
-    terminal::ClearType,
-    QueueableCommand,
-};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Write content to a file atomically using a temp file + rename.
 /// Prevents file corruption if the process is interrupted during a write.
@@ -30,22 +23,6 @@ fn write_atomic(path: &str, content: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
         e
     })
-}
-
-/// Truncate a string to fit within `max_cols` terminal display columns.
-fn truncate_to_width(s: &str, max_cols: usize) -> String {
-    let mut width = 0;
-    s.graphemes(true)
-        .take_while(|g| {
-            let w = UnicodeWidthStr::width(*g);
-            if width + w <= max_cols {
-                width += w;
-                true
-            } else {
-                false
-            }
-        })
-        .collect()
 }
 
 #[derive(Clone, PartialEq)]
@@ -386,16 +363,15 @@ impl Editor {
             self.cursor_col -= 1;
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
-            self.cursor_col = self.buffer.get(self.cursor_row)
-                .map(|l| Self::grapheme_len(l))
-                .unwrap_or(0);
+            let line_len = self.buffer.get(self.cursor_row)
+                .map_or(0, |line| Self::grapheme_len(line));
+            self.cursor_col = line_len;
         }
     }
 
     pub fn cursor_right(&mut self) {
         let line_len = self.buffer.get(self.cursor_row)
-            .map(|l| Self::grapheme_len(l))
-            .unwrap_or(0);
+            .map_or(0, |line| Self::grapheme_len(line));
         if self.cursor_col < line_len {
             self.cursor_col += 1;
         } else if self.cursor_row < self.buffer.len() - 1 {
@@ -420,14 +396,12 @@ impl Editor {
 
     pub fn cursor_end(&mut self) {
         self.cursor_col = self.buffer.get(self.cursor_row)
-            .map(|l| Self::grapheme_len(l))
-            .unwrap_or(0);
+            .map_or(0, |line| Self::grapheme_len(line));
     }
 
     fn clamp_cursor_col(&mut self) {
         let line_len = self.buffer.get(self.cursor_row)
-            .map(|l| Self::grapheme_len(l))
-            .unwrap_or(0);
+            .map_or(0, |line| Self::grapheme_len(line));
         self.cursor_col = self.cursor_col.min(line_len);
     }
 
@@ -494,7 +468,7 @@ impl Editor {
 
     /// Clamps scroll, then snapshots render state.
     pub fn render_state(&mut self, visible_rows: usize) -> RenderState {
-        // Scroll clamping (mirrors what render() does)
+        // Scroll clamping for the state snapshot.
         if self.cursor_row < self.row_offset {
             self.row_offset = self.cursor_row;
         } else if visible_rows > 0 && self.cursor_row >= self.row_offset + visible_rows {
@@ -508,100 +482,6 @@ impl Editor {
             prompt_mode: self.prompt_mode.clone(),
             message: self.message.clone(),
         }
-    }
-
-    #[cfg(test)]
-    pub fn render<W: Write>(&mut self, stdout: &mut W, cols: u16, rows: u16) -> io::Result<()> {
-        // Calculate visible rows (reserve bottom line for messages/prompts)
-        let visible_rows = rows.saturating_sub(1) as usize;
-
-        // Adjust row_offset for scrolling
-        if self.cursor_row < self.row_offset {
-            self.row_offset = self.cursor_row;
-        } else if self.cursor_row >= self.row_offset + visible_rows {
-            self.row_offset = self.cursor_row - visible_rows + 1;
-        }
-
-        // Clear screen
-        stdout.queue(crossterm::terminal::Clear(ClearType::All))?;
-
-        // Render visible lines
-        for (i, line_idx) in (self.row_offset..self.buffer.len()).enumerate() {
-            if i >= visible_rows {
-                break;
-            }
-            stdout.queue(MoveTo(0, i as u16))?;
-
-            // Truncate by display width, not char count, to handle wide characters
-            let line = &self.buffer[line_idx];
-            let max_cols = cols as usize;
-            let mut display_width = 0;
-            let truncated: String = line.graphemes(true)
-                .take_while(|g| {
-                    let w = UnicodeWidthStr::width(*g);
-                    if display_width + w <= max_cols {
-                        display_width += w;
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .collect();
-            stdout.queue(Print(truncated))?;
-        }
-
-        // Show prompt or message on bottom line
-        stdout.queue(MoveTo(0, rows - 1))?;
-        match &self.prompt_mode {
-            PromptMode::SaveAs(input) => {
-                let prompt = format!("Save as: {}", input);
-                let truncated = truncate_to_width(&prompt, cols as usize);
-                stdout.queue(Print(truncated))?;
-            }
-            PromptMode::Find(input) => {
-                let prompt = format!("Find: {}", input);
-                let truncated = truncate_to_width(&prompt, cols as usize);
-                stdout.queue(Print(truncated))?;
-            }
-            PromptMode::ConfirmExit => {
-                stdout.queue(Print("Save changes? (Y/n): "))?;
-            }
-            PromptMode::None => {
-                if let Some(ref msg) = self.message {
-                    let truncated = truncate_to_width(msg, cols as usize);
-                    stdout.queue(Print(truncated))?;
-                }
-            }
-        }
-
-        // Position cursor - in prompt mode, put cursor at end of prompt line
-        match &self.prompt_mode {
-            PromptMode::SaveAs(input) => {
-                let prompt = format!("Save as: {}", input);
-                let prompt_display_width = UnicodeWidthStr::width(prompt.as_str()) as u16;
-                stdout.queue(MoveTo(prompt_display_width.min(cols.saturating_sub(1)), rows - 1))?;
-            }
-            PromptMode::Find(input) => {
-                let prompt = format!("Find: {}", input);
-                let prompt_display_width = UnicodeWidthStr::width(prompt.as_str()) as u16;
-                stdout.queue(MoveTo(prompt_display_width.min(cols.saturating_sub(1)), rows - 1))?;
-            }
-            PromptMode::ConfirmExit => {
-                stdout.queue(MoveTo(20, rows - 1))?;
-            }
-            PromptMode::None => {
-                let cursor_screen_row = (self.cursor_row - self.row_offset) as u16;
-                // Compute display column as sum of widths of graphemes left of cursor
-                let line = self.buffer.get(self.cursor_row).map(String::as_str).unwrap_or("");
-                let cursor_display_col: usize = line.graphemes(true)
-                    .take(self.cursor_col)
-                    .map(UnicodeWidthStr::width)
-                    .sum();
-                stdout.queue(MoveTo(cursor_display_col as u16, cursor_screen_row))?;
-            }
-        }
-
-        Ok(())
     }
 }
 
