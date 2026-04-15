@@ -15,16 +15,33 @@ use scopeguard::defer;
 use editor::Editor;
 use input::{handle_input, Action};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    // Check for help flag
-    if args.len() == 2 && (args[1] == "-h" || args[1] == "--help") {
-        print_help();
-        return Ok(());
+#[derive(Debug)]
+enum StartupMode {
+    Open(Option<String>),
+    Help,
+    Version,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let startup = parse_args(env::args())?;
+    match startup {
+        StartupMode::Help => {
+            print_help();
+            return Ok(());
+        }
+        StartupMode::Version => {
+            print_version();
+            return Ok(());
+        }
+        StartupMode::Open(_) => {}
     }
 
-    let filename = args.get(1).map(|s| s.as_str());
+    let filename = match &startup {
+        StartupMode::Open(path) => path.as_deref(),
+        StartupMode::Help | StartupMode::Version => None,
+    };
 
     // Enter raw terminal mode
     terminal::enable_raw_mode()?;
@@ -54,12 +71,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_event_loop(&mut editor)
 }
 
+fn parse_args<I>(args: I) -> Result<StartupMode, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut iter = args.into_iter();
+    let program = iter.next().unwrap_or_else(|| "ultranano".to_string());
+    let mut positional: Vec<String> = Vec::new();
+    let mut parsing_flags = true;
+
+    for arg in iter {
+        if parsing_flags {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(StartupMode::Help),
+                "-V" | "--version" => return Ok(StartupMode::Version),
+                "--" => {
+                    parsing_flags = false;
+                    continue;
+                }
+                _ if arg.starts_with('-') => {
+                    return Err(format!("Unknown option: {arg}\nTry '{program} --help'"));
+                }
+                _ => {}
+            }
+        }
+
+        positional.push(arg);
+        if positional.len() > 1 {
+            return Err(format!("Too many arguments\nUsage: {program} [FILE]"));
+        }
+    }
+
+    Ok(StartupMode::Open(positional.into_iter().next()))
+}
+
 fn print_help() {
     println!("ultranano - A minimal terminal text editor\n");
     println!("USAGE:");
     println!("    ultranano [FILE]\n");
     println!("OPTIONS:");
-    println!("    -h, --help    Show this help message\n");
+    println!("    -h, --help    Show this help message");
+    println!("    -V, --version Show version information\n");
     println!("KEYBINDINGS:");
     println!("  Ctrl+X         Exit editor");
     println!("  Ctrl+S         Save / Save as");
@@ -77,6 +129,10 @@ fn print_help() {
     println!("\n  In prompts:");
     println!("  Enter          Submit");
     println!("  Esc            Cancel");
+}
+
+fn print_version() {
+    println!("ultranano {}", VERSION);
 }
 
 fn run_event_loop(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>> {
@@ -184,5 +240,55 @@ fn save_with_message(editor: &mut Editor) -> bool {
             editor.message = Some(format!("Error saving: {}", e));
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_args, StartupMode};
+
+    fn parse(args: &[&str]) -> Result<StartupMode, String> {
+        parse_args(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn parses_help_flag() {
+        assert!(matches!(parse(&["un", "--help"]), Ok(StartupMode::Help)));
+        assert!(matches!(parse(&["un", "-h"]), Ok(StartupMode::Help)));
+    }
+
+    #[test]
+    fn parses_version_flag() {
+        assert!(matches!(parse(&["un", "--version"]), Ok(StartupMode::Version)));
+        assert!(matches!(parse(&["un", "-V"]), Ok(StartupMode::Version)));
+    }
+
+    #[test]
+    fn parses_optional_filename() {
+        assert!(matches!(parse(&["un"]), Ok(StartupMode::Open(None))));
+        assert!(matches!(
+            parse(&["un", "notes.txt"]),
+            Ok(StartupMode::Open(Some(path))) if path == "notes.txt"
+        ));
+    }
+
+    #[test]
+    fn supports_double_dash_before_filename() {
+        assert!(matches!(
+            parse(&["un", "--", "--notes.txt"]),
+            Ok(StartupMode::Open(Some(path))) if path == "--notes.txt"
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_flags() {
+        let error = parse(&["un", "--wat"]).unwrap_err();
+        assert!(error.contains("Unknown option: --wat"));
+    }
+
+    #[test]
+    fn rejects_extra_positional_args() {
+        let error = parse(&["un", "a.txt", "b.txt"]).unwrap_err();
+        assert!(error.contains("Too many arguments"));
     }
 }

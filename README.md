@@ -21,6 +21,12 @@ Downloads the latest pre-built binary and installs `un` to `~/.local/bin`. Linux
 un <filename>
 ```
 
+Flags:
+
+- `-h`, `--help` show help
+- `-V`, `--version` show version
+- `--` treat the next argument as a filename even if it starts with `-`
+
 ## Features
 
 - Unicode-aware cursor movement and editing
